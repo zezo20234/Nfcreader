@@ -1,0 +1,345 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>NFC Inspector — Production</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{font-family:system-ui,Segoe UI,Roboto,Arial;line-height:1.45}
+    body{max-width:980px;margin:18px auto;padding:18px}
+    h1{margin:0 0 6px}
+    .muted{color:#555;font-size:0.95rem}
+    .row{display:flex;gap:10px;flex-wrap:wrap;margin:8px 0}
+    button{padding:10px 14px;font-size:15px;border-radius:8px;border:1px solid #ccc;background:#f5f5f5;cursor:pointer}
+    button.primary{background:#0078d4;color:white;border-color:#0063b1}
+    button.warn{background:#ffefef;border-color:#f2b8b8}
+    input,textarea,select{padding:8px;border-radius:6px;border:1px solid #ccc;font-size:14px;width:100%}
+    textarea{min-height:100px;font-family:monospace}
+    .panel{border:1px solid #e6e6e6;padding:12px;border-radius:10px;background:#fff}
+    pre{background:#f7f7f7;padding:10px;border-radius:8px;overflow:auto;white-space:pre-wrap}
+    label{font-weight:600;font-size:0.95rem}
+    small.note{display:block;color:#666;margin-top:6px}
+    .flex{display:flex;gap:10px}
+    .col{flex:1}
+    .split{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .inline{display:inline-flex;gap:8px;align-items:center}
+    footer{margin-top:18px;color:#444;font-size:0.9rem}
+    a.link{color:#0066cc}
+    .success{color:green}
+    .error{color:#b00020}
+    .badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#eee}
+    .field{margin-top:8px}
+  </style>
+</head>
+<body>
+  <h1>NFC Inspector — Production</h1>
+  <div class="muted">Use <strong>Chrome on Android</strong>. Host via HTTPS (GitHub Pages). This page reads and writes NDEF records and exports backups. Read the README for deployment and compatibility notes.</div>
+
+  <div class="panel" style="margin-top:12px">
+    <div class="row">
+      <button id="readOnce" class="primary">Read once (tap tag)</button>
+      <button id="startScan">Start continuous scan</button>
+      <button id="stopScan">Stop scan</button>
+      <button id="exportBackup">Export last backup</button>
+      <button id="importBackup">Import & write backup</button>
+    </div>
+
+    <div class="split">
+      <div>
+        <label>Tag summary</label>
+        <pre id="tagSummary">No tag scanned yet.</pre>
+        <div class="field"><label>UID / serialNumber (hex)</label><div id="uidHex" class="badge">—</div></div>
+        <div class="field"><label>Records count</label><div id="recCount" class="badge">0</div></div>
+      </div>
+
+      <div>
+        <label>Parsed records</label>
+        <pre id="records">—</pre>
+      </div>
+    </div>
+
+    <hr />
+
+    <div>
+      <label>Write controls</label>
+      <div class="row">
+        <div style="flex:1">
+          <small>Text record</small>
+          <input id="textPayload" placeholder="Hello — POINTS: 9999 (prank)" />
+        </div>
+        <div style="flex:1">
+          <small>URL record</small>
+          <input id="urlPayload" placeholder="https://example.com/prank" />
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:8px">
+        <button id="writeText">Write Text</button>
+        <button id="writeUrlBtn">Write URL</button>
+        <button id="writeMulti">Write Multi-record (Text+URL)</button>
+        <button id="clearTag" class="warn">Clear / Empty</button>
+      </div>
+
+      <div style="margin-top:10px">
+        <label>Custom record (advanced)</label>
+        <div class="row">
+          <select id="customType" style="width:200px">
+            <option value="text">text</option>
+            <option value="url">url</option>
+            <option value="mime">mime</option>
+            <option value="unknown">unknown (base64)</option>
+          </select>
+          <input id="customMime" placeholder="mime/type for mime" style="width:220px" />
+          <input id="customPayload" placeholder="payload text or base64" />
+          <button id="writeCustom">Write custom</button>
+        </div>
+        <small class="note">Writing requires a user gesture & permission dialog. If write fails, the tag may be locked or non-NDEF.</small>
+      </div>
+    </div>
+
+    <hr />
+
+    <div>
+      <label>Log</label>
+      <pre id="log">Ready.</pre>
+    </div>
+
+    <input type="file" id="importFile" accept=".json" style="display:none" />
+  </div>
+
+  <footer>
+    <p>Remember: this modifies the physical tag only. Server-validated game scores cannot be changed by editing a tag. Use only on tags you own.</p>
+  </footer>
+
+<script>
+(function(){
+  const logEl = document.getElementById('log');
+  const tagSummaryEl = document.getElementById('tagSummary');
+  const recordsEl = document.getElementById('records');
+  const uidEl = document.getElementById('uidHex');
+  const recCountEl = document.getElementById('recCount');
+
+  function log(...args){
+    const line = args.map(a => (typeof a === 'object')? JSON.stringify(a,null,2): String(a)).join(' ');
+    logEl.textContent += '\n' + line;
+    logEl.scrollTop = logEl.scrollHeight;
+    console.log(...args);
+  }
+
+  function hexFromSerial(serial){
+    if (!serial) return '—';
+    try {
+      // serialNumber from Web NFC might already be hex-like; normalize
+      return Array.from(new TextEncoder().encode(serial)).map(b => b.toString(16).padStart(2,'0')).join(' ');
+    } catch(e){
+      return serial;
+    }
+  }
+
+  function parseRecords(message){
+    if (!message || !message.records) return [];
+    const out = [];
+    for (const r of message.records){
+      const rec = {recordType: r.recordType, mediaType: r.mediaType || null, id: r.id || null};
+      try {
+        if (r.recordType === 'text') {
+          const td = new TextDecoder(r.encoding || 'utf-8');
+          rec.text = td.decode(r.data);
+        } else if (r.recordType === 'url') {
+          const td = new TextDecoder();
+          rec.url = td.decode(r.data);
+        } else if (r.recordType === 'mime') {
+          const td = new TextDecoder();
+          rec.mimeText = td.decode(r.data);
+          rec.payloadBase64 = btoa(String.fromCharCode(...new Uint8Array(r.data.buffer || r.data)));
+        } else {
+          rec.payloadBase64 = btoa(String.fromCharCode(...new Uint8Array(r.data.buffer || r.data)));
+        }
+      } catch(e){
+        rec.error = String(e);
+      }
+      out.push(rec);
+    }
+    return out;
+  }
+
+  let lastMessage = null;
+  let lastSerial = null;
+  let reader = null;
+
+  async function readOnce(){
+    if (!('NDEFReader' in window)) { alert('Web NFC not available. Use Chrome on Android.'); return; }
+    try {
+      const temp = new NDEFReader();
+      log('Waiting to read — tap tag now.');
+      await temp.scan();
+      temp.onreading = ev => {
+        lastSerial = ev.serialNumber || null;
+        lastMessage = ev.message;
+        const parsed = parseRecords(ev.message);
+        const summary = {serialNumber: lastSerial, records: parsed, timestamp: new Date().toISOString()};
+        tagSummaryEl.textContent = JSON.stringify(summary, null, 2);
+        recordsEl.textContent = JSON.stringify(parsed, null, 2);
+        uidEl.textContent = hexFromSerial(lastSerial);
+        recCountEl.textContent = (ev.message.records || []).length;
+        log('Read OK', summary);
+        temp.onreading = null;
+        temp.onreadingerror = null;
+      };
+      temp.onreadingerror = () => log('Read error.');
+    } catch(err){
+      log('ReadOnce failed: ' + String(err));
+      alert('Read failed: ' + String(err));
+    }
+  }
+
+  async function startScan(){
+    if (!('NDEFReader' in window)) { alert('Web NFC not available. Use Chrome on Android.'); return; }
+    try {
+      reader = new NDEFReader();
+      await reader.scan();
+      reader.onreading = ev => {
+        lastSerial = ev.serialNumber || null;
+        lastMessage = ev.message;
+        const parsed = parseRecords(ev.message);
+        const summary = {serialNumber: lastSerial, records: parsed, timestamp: new Date().toISOString()};
+        tagSummaryEl.textContent = JSON.stringify(summary, null, 2);
+        recordsEl.textContent = JSON.stringify(parsed, null, 2);
+        uidEl.textContent = hexFromSerial(lastSerial);
+        recCountEl.textContent = (ev.message.records || []).length;
+        log('Tag read (continuous)', summary);
+      };
+      reader.onreadingerror = () => log('Continuous read error.');
+      log('Continuous scan started — keep the page open and tap tags.');
+    } catch(err){
+      log('StartScan failed: ' + String(err));
+      alert('Start scan failed: ' + String(err));
+    }
+  }
+
+  function stopScan(){
+    if (!reader) { log('No active scan.'); return; }
+    reader.onreading = null;
+    reader.onreadingerror = null;
+    reader = null;
+    log('Scan stopped.');
+  }
+
+  async function writeRecords(records){
+    if (!('NDEFReader' in window)) { alert('Web NFC not available. Use Chrome on Android.'); return; }
+    try {
+      const w = new NDEFReader();
+      log('Tap a tag to write... (you will be prompted for permission)');
+      await w.write({records});
+      log('Write completed successfully.');
+    } catch(err){
+      log('Write failed: ' + String(err));
+      alert('Write failed: ' + String(err));
+    }
+  }
+
+  document.getElementById('readOnce').addEventListener('click', readOnce);
+  document.getElementById('startScan').addEventListener('click', startScan);
+  document.getElementById('stopScan').addEventListener('click', stopScan);
+
+  document.getElementById('writeText').addEventListener('click', async () => {
+    const text = document.getElementById('textPayload').value || 'POINTS: 9999 (prank)';
+    await writeRecords([{recordType:'text', data: text}]);
+  });
+  document.getElementById('writeUrlBtn').addEventListener('click', async () => {
+    const url = document.getElementById('urlPayload').value || 'https://example.com/prank';
+    await writeRecords([{recordType:'url', data: url}]);
+  });
+  document.getElementById('writeMulti').addEventListener('click', async () => {
+    const text = document.getElementById('textPayload').value || 'POINTS: 9999 (prank)';
+    const url = document.getElementById('urlPayload').value || 'https://example.com/prank';
+    await writeRecords([{recordType:'text', data: text},{recordType:'url', data: url}]);
+  });
+  document.getElementById('clearTag').addEventListener('click', async () => {
+    try {
+      const w = new NDEFReader();
+      await w.write({records: []});
+      log('Wrote empty message (if supported).');
+    } catch(e){
+      log('Empty write failed, trying empty text record...');
+      try {
+        const w2 = new NDEFReader();
+        await w2.write({records:[{recordType:'text', data:''}]});
+        log('Wrote empty text record.');
+      } catch(e2){
+        log('Clear fallback failed: ' + String(e2));
+      }
+    }
+  });
+
+  document.getElementById('writeCustom').addEventListener('click', async () => {
+    const type = document.getElementById('customType').value;
+    const mime = document.getElementById('customMime').value;
+    const payload = document.getElementById('customPayload').value || '';
+    if (type === 'text') {
+      await writeRecords([{recordType:'text', data: payload}]);
+    } else if (type === 'url') {
+      await writeRecords([{recordType:'url', data: payload}]);
+    } else if (type === 'mime') {
+      if (!mime) { alert('Enter mime type'); return; }
+      await writeRecords([{recordType:'mime', mediaType: mime, data: payload}]);
+    } else {
+      if (!payload) { alert('Enter base64 payload'); return; }
+      const binary = atob(payload);
+      const arr = new Uint8Array(binary.length);
+      for (let i=0;i<binary.length;i++) arr[i] = binary.charCodeAt(i);
+      await writeRecords([{recordType:'unknown', data: arr}]);
+    }
+  });
+
+  // export/import backup
+  document.getElementById('exportBackup').addEventListener('click', () => {
+    if (!lastMessage) { alert('No tag scanned yet.'); return; }
+    const parsed = parseRecords(lastMessage);
+    const backup = {serialNumber: lastSerial, timestamp: new Date().toISOString(), records: parsed};
+    const blob = new Blob([JSON.stringify(backup,null,2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'nfc-backup-'+Date.now()+'.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    log('Backup exported.');
+  });
+
+  document.getElementById('importBackup').addEventListener('click', () => {
+    document.getElementById('importFile').click();
+  });
+
+  document.getElementById('importFile').addEventListener('change', async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const text = await f.text();
+    let obj;
+    try { obj = JSON.parse(text); } catch(e){ alert('Invalid JSON'); return; }
+    if (!obj.records || !obj.records.length) { alert('No records found in backup'); return; }
+    const records = [];
+    for (const r of obj.records){
+      if (r.recordType === 'text') records.push({recordType:'text', data: r.text || ''});
+      else if (r.recordType === 'url') records.push({recordType:'url', data: r.url || ''});
+      else if (r.recordType === 'mime') records.push({recordType:'mime', mediaType: r.mediaType || '', data: r.mimeText || ''});
+      else {
+        const b64 = r.payloadBase64 || '';
+        if (!b64) continue;
+        const binary = atob(b64);
+        const arr = new Uint8Array(binary.length);
+        for (let i=0;i<binary.length;i++) arr[i] = binary.charCodeAt(i);
+        records.push({recordType:'unknown', data: arr});
+      }
+    }
+    if (!records.length) { alert('No writable records parsed'); return; }
+    if (!confirm('This will write the imported records to a tag. Continue?')) return;
+    await writeRecords(records);
+  });
+
+  // initial UI
+  tagSummaryEl.textContent = 'No tag scanned yet. Use "Read once" or "Start continuous scan".';
+})();
+</script>
+</body>
+</html>
